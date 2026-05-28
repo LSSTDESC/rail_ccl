@@ -2,14 +2,13 @@
 Cosmic shear signal-to-noise evaluator using CCL.
 
 Computes the total SNR of a tomographic cosmic shear analysis from
-per-bin n(z) distributions stored as qp ensembles.  The angular power
-spectra are computed via CCL's Limber approximation, and the Gaussian
-covariance matrix is assembled from the total (signal + shape-noise)
-power spectra.
+per-bin n(z) distributions stored as a single multi-row qp ensemble
+and per-bin effective number densities stored in a companion HDF5 file.
 """
 
 from __future__ import annotations
 
+import collections
 from typing import Any
 
 import numpy as np
@@ -24,49 +23,65 @@ from rail.core.stage import RailStage
 class CosmicShearSNREvaluator(RailStage):
     """Evaluate the total SNR of a tomographic cosmic shear analysis.
 
+    The number of tomographic bins is inferred from the number of rows
+    (``npdf``) in the input qp ensemble.
+
     Inputs
     ------
-    input_0 … input_3 : QPHandle
-        Stacked n(z) ensemble for each tomographic bin (bin 0 first).
-        Only the first ``n_bins`` inputs are read.
+    input : QPHandle
+        A qp ensemble with ``n_bins`` rows.  Each row is the normalised
+        n(z) distribution for one tomographic bin (bin 0 first).
+        The interp parameterisation is assumed; ``dist.xvals`` is the
+        shared redshift grid and ``dist.yvals`` has shape
+        ``(n_bins, n_z)``.
+
+    nz_summary : Hdf5Handle
+        HDF5 file that stores survey summary statistics.  Expected
+        structure (as written by :func:`tables_io.write`)::
+
+            nz_summary/
+                neff   – array of shape (n_bins,), effective number
+                         density [arcmin^{-2}] per tomographic bin.
 
     Config
     ------
-    n_bins : int
-        Number of tomographic bins (1–4; default 4).
-    neff : list[float]
-        Effective galaxy number density [arcmin^{-2}] for each bin.
     f_sky : float
-        Sky fraction covered by the survey.
+        Fraction of sky covered by the survey.
     sigma_e : float
-        Per-component *total* ellipticity dispersion (intrinsic + measurement).
+        Per-component *total* ellipticity dispersion (intrinsic +
+        measurement noise combined in quadrature).
     ell_min, ell_max, n_ell : float, float, int
-        Log-spaced multipole grid (default: 100–15 800 in 17 bins).
+        Log-spaced multipole grid (default: 100–15 800 in 17 bins,
+        matching the reference notebook).
     ell_min_cut, ell_max_cut : float, float
-        Multipole scale cuts used when computing the SNR (default: 300–1 800).
-    z_eval_min, z_eval_max, n_z_eval : float, float, int
-        Redshift grid for evaluating n(z) from the qp ensemble.
+        Multipole scale cuts applied when computing the SNR
+        (default: 300–1 800).
+    neff_groupname : str
+        Top-level group name in the nz_summary HDF5 (default
+        ``"nz_summary"``).
+    neff_colname : str
+        Column / dataset name for neff within that group (default
+        ``"neff"``).
 
     Outputs
     -------
     output : Hdf5Handle
-        HDF5 file with keys:
-        ``snr``          – total SNR (scalar),
-        ``snr_per_pair`` – per-pair SNR in diagonal-block approximation,
-        ``pair_i``, ``pair_j`` – bin indices for each pair (0-based),
-        ``cls``          – signal C_ℓ array, shape (n_pairs, n_ell),
-        ``ells``         – multipole centres.
+        HDF5 file with two tables:
+
+        ``pairs``
+            One row per unique (i, j) pair.  Columns:
+            ``pair_i``, ``pair_j``, ``snr_per_pair``,
+            ``cls_ell_0`` … ``cls_ell_{n_ell-1}``.
+
+        ``summary``
+            One-row scalar results:
+            ``total_snr``, ``n_bins``, ``ell_min_cut``,
+            ``ell_max_cut``, ``ell_0`` … ``ell_{n_ell-1}``.
     """
 
     name = "CosmicShearSNREvaluator"
     config_options = RailStage.config_options.copy()
     config_options.update(
-        n_bins=Param(int, 4, msg="Number of tomographic bins (1–4)"),
-        neff=Param(
-            list,
-            [5.0, 5.0, 5.0, 5.0],
-            msg="Effective galaxy number density [arcmin^-2] per bin",
-        ),
         f_sky=Param(float, 0.01, msg="Fraction of sky covered by the survey"),
         sigma_e=Param(
             float,
@@ -78,46 +93,39 @@ class CosmicShearSNREvaluator(RailStage):
         n_ell=Param(int, 17, msg="Number of log-spaced multipole bins"),
         ell_min_cut=Param(float, 300.0, msg="Lower multipole scale cut for SNR"),
         ell_max_cut=Param(float, 1800.0, msg="Upper multipole scale cut for SNR"),
-        z_eval_min=Param(float, 0.005, msg="Minimum redshift for n(z) evaluation"),
-        z_eval_max=Param(float, 3.0, msg="Maximum redshift for n(z) evaluation"),
-        n_z_eval=Param(int, 300, msg="Number of redshift grid points for n(z)"),
+        neff_groupname=Param(
+            str, "nz_summary", msg="HDF5 group name in the nz_summary file"
+        ),
+        neff_colname=Param(
+            str, "neff", msg="Column name for neff within the nz_summary group"
+        ),
     )
 
-    # Up to 4 tomographic bins; only the first n_bins inputs are used.
     inputs = [
-        ("input_0", QPHandle),
-        ("input_1", QPHandle),
-        ("input_2", QPHandle),
-        ("input_3", QPHandle),
+        ("input", QPHandle),        # multi-row n(z) ensemble, one row per bin
+        ("nz_summary", Hdf5Handle), # effective number densities
     ]
     outputs = [("output", Hdf5Handle)]
 
-    def evaluate(
-        self,
-        ens_0: Any,
-        ens_1: Any | None = None,
-        ens_2: Any | None = None,
-        ens_3: Any | None = None,
-    ) -> Hdf5Handle:
+    def evaluate(self, nz_ensemble: Any, nz_summary_data: Any) -> Hdf5Handle:
         """Compute the cosmic shear SNR.
 
         Parameters
         ----------
-        ens_0 … ens_3 : qp.Ensemble
-            n(z) ensembles for bins 0–3.  Pass ``None`` for bins beyond
-            ``n_bins``.
+        nz_ensemble : qp.Ensemble
+            Multi-row qp ensemble (``npdf == n_bins``).
+        nz_summary_data : dict-like
+            Data as returned by ``tables_io.read`` for the nz_summary
+            HDF5 file (an OrderedDict with group ``neff_groupname``
+            containing column ``neff_colname``).
 
         Returns
         -------
         Hdf5Handle
             Handle to the output metrics file.
         """
-        n_bins = self.config.n_bins
-        ensembles = [ens_0, ens_1, ens_2, ens_3]
-        for i in range(n_bins):
-            if ensembles[i] is None:
-                raise ValueError(f"n_bins={n_bins} but ens_{i} is None")
-            self.set_data(f"input_{i}", ensembles[i])
+        self.set_data("input", nz_ensemble)
+        self.set_data("nz_summary", nz_summary_data)
         self.run()
         self.finalize()
         return self.get_handle("output")
@@ -126,19 +134,56 @@ class CosmicShearSNREvaluator(RailStage):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _read_nz(self, z_grid: np.ndarray) -> list[np.ndarray]:
-        """Read and normalise n(z) for each bin from the data store."""
-        n_bins = self.config.n_bins
-        nz_list = []
+    def _read_nz(self, ens: Any) -> tuple[np.ndarray, list[np.ndarray]]:
+        """Extract and normalise the per-bin n(z) from a qp ensemble.
+
+        Parameters
+        ----------
+        ens : qp.Ensemble
+            Multi-row interp ensemble; ``dist.xvals`` shape ``(n_z,)``,
+            ``dist.yvals`` shape ``(n_bins, n_z)``.
+
+        Returns
+        -------
+        z_grid : ndarray, shape (n_z,)
+        nz_list : list of ndarray, length n_bins
+            Normalised n(z) for each bin.
+        """
+        z_grid = np.asarray(ens.dist.xvals, dtype=float)
+        yvals = np.asarray(ens.dist.yvals, dtype=float)
+        n_bins = ens.npdf
+
+        nz_list: list[np.ndarray] = []
         for b in range(n_bins):
-            ens = self.get_data(f"input_{b}")
-            pz = np.asarray(ens.pdf(z_grid), dtype=float)
-            pz = np.nan_to_num(pz, nan=0.0, posinf=0.0)
+            pz = np.nan_to_num(yvals[b], nan=0.0, posinf=0.0)
             norm = np.trapezoid(pz, z_grid)
             if norm > 0.0:
-                pz /= norm
+                pz = pz / norm
             nz_list.append(pz)
-        return nz_list
+        return z_grid, nz_list
+
+    def _read_neff(self, nz_summary_data: Any, n_bins: int) -> np.ndarray:
+        """Extract neff from the nz_summary data dict.
+
+        Parameters
+        ----------
+        nz_summary_data : dict-like
+            As returned by ``tables_io.read``.
+        n_bins : int
+            Expected number of bins (used for validation).
+
+        Returns
+        -------
+        neff : ndarray, shape (n_bins,)  [arcmin^{-2}]
+        """
+        grp = nz_summary_data[self.config.neff_groupname]
+        neff = np.asarray(grp[self.config.neff_colname], dtype=float)
+        if len(neff) != n_bins:
+            raise ValueError(
+                f"neff has {len(neff)} entries but the qp ensemble has "
+                f"{n_bins} rows (n_bins mismatch)."
+            )
+        return neff
 
     @staticmethod
     def _gaussian_covariance(
@@ -151,14 +196,15 @@ class CosmicShearSNREvaluator(RailStage):
     ) -> np.ndarray:
         """Build the Gaussian covariance matrix of the C_ell data vector.
 
-        The data vector is ordered as:
-            [C_ell^{pair_0}, C_ell^{pair_1}, …]
-        where each block has ``n_ell`` entries.
+        The data vector ordering is [C_ell^{pair_0}, C_ell^{pair_1}, …],
+        each block having ``n_ell`` entries.
 
-        The diagonal Gaussian covariance element is:
+        The diagonal Gaussian covariance element is::
 
             Cov(C_ℓ^{ij}, C_ℓ^{kl}) = δ_{ℓℓ'} / [(2ℓ+1) Δℓ f_sky]
                 × [C_ℓ_tot^{ik} C_ℓ_tot^{jl} + C_ℓ_tot^{il} C_ℓ_tot^{jk}]
+
+        where ``C_ℓ_tot^{ij} = C_ℓ^{ij} + δ_{ij} σ_e² / n_i``.
         """
         n_pairs, n_ell = cls.shape
 
@@ -190,12 +236,16 @@ class CosmicShearSNREvaluator(RailStage):
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        n_bins = self.config.n_bins
         n_ell = self.config.n_ell
 
-        # --- n(z) ---
-        z_grid = np.linspace(self.config.z_eval_min, self.config.z_eval_max, self.config.n_z_eval)
-        nz_list = self._read_nz(z_grid)
+        # --- n(z) and number of bins ---
+        ens = self.get_data("input")
+        z_grid, nz_list = self._read_nz(ens)
+        n_bins = ens.npdf
+
+        # --- neff ---
+        nz_summary_data = self.get_data("nz_summary")
+        neff = self._read_neff(nz_summary_data, n_bins)
 
         # --- multipole grid ---
         ells = np.geomspace(self.config.ell_min, self.config.ell_max, n_ell)
@@ -216,9 +266,8 @@ class CosmicShearSNREvaluator(RailStage):
 
         # --- shape-noise power spectra ---
         arcmin2_per_sr = (180.0 * 60.0 / np.pi) ** 2
-        neff = np.asarray(self.config.neff[:n_bins], dtype=float)
         neff_sr = neff * arcmin2_per_sr
-        noise = self.config.sigma_e ** 2 / neff_sr  # (n_bins,)
+        noise = self.config.sigma_e ** 2 / neff_sr  # shape (n_bins,)
 
         # --- Gaussian covariance ---
         cov = self._gaussian_covariance(
@@ -236,7 +285,7 @@ class CosmicShearSNREvaluator(RailStage):
         cov_sel = cov[np.ix_(sel_idx, sel_idx)]
         snr = float(np.sqrt(max(float(d_sel @ np.linalg.inv(cov_sel) @ d_sel), 0.0)))
 
-        # per-pair SNR (diagonal block approximation)
+        # --- per-pair SNR (diagonal block approximation) ---
         n_sel_ell = len(ell_idx)
         snr_per_pair = np.zeros(n_pairs)
         for p in range(n_pairs):
@@ -247,32 +296,28 @@ class CosmicShearSNREvaluator(RailStage):
                 np.sqrt(max(float(dp @ np.linalg.inv(covp) @ dp), 0.0))
             )
 
-        pair_i = np.array([i for i, j in pairs])
-        pair_j = np.array([j for i, j in pairs])
-
-        # Per-pair table: one row per unique (i,j) pair.
-        # Store C_ell values as individual columns (cls_ell_0, cls_ell_1, …).
+        # --- build output tables ---
         pair_data: dict[str, Any] = {
-            "pair_i": pair_i,
-            "pair_j": pair_j,
+            "pair_i": np.array([i for i, j in pairs]),
+            "pair_j": np.array([j for i, j in pairs]),
             "snr_per_pair": snr_per_pair,
         }
         for l_idx in range(n_ell):
             pair_data[f"cls_ell_{l_idx}"] = cls[:, l_idx]
 
-        # Scalar summary: one row.
         summary_data: dict[str, Any] = {
             "total_snr": np.array([snr]),
+            "n_bins": np.array([n_bins]),
             "ell_min_cut": np.array([self.config.ell_min_cut]),
             "ell_max_cut": np.array([self.config.ell_max_cut]),
         }
         for l_idx in range(n_ell):
             summary_data[f"ell_{l_idx}"] = np.array([ells[l_idx]])
 
-        # tables_io requires a table-like object; use pandas DataFrames.
-        import collections
-        out = collections.OrderedDict([
-            ("pairs", pd.DataFrame(pair_data)),
-            ("summary", pd.DataFrame(summary_data)),
-        ])
-        self.add_data("output", out)
+        self.add_data(
+            "output",
+            collections.OrderedDict([
+                ("pairs", pd.DataFrame(pair_data)),
+                ("summary", pd.DataFrame(summary_data)),
+            ]),
+        )
